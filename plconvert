@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import subprocess
+import sys
+import click
+import locale
+
+from pathlib import Path
+from typing import List
+
+# Add the path to the "lib" dir to allow importing our libraries
+# without having to manually set PYTHONPATH before calling this script.
+sys.path.append(str(Path(__file__).resolve().parent / "lib"))
+
+import plconvert.jellyfin.playlist as jf
+import plconvert.m3u as m3u
+
+
+class PlaylistFormatter:
+    FORMATS = ["auto", "jellyfin", "m3u"]
+
+    def __init__(self, format: str):
+        self.format = format
+
+    @property
+    def is_jellyfin(self):
+        return self.format == "jellyfin"
+
+    @property
+    def is_m3u(self):
+        return self.format == "m3u"
+
+    def detect(self, first_line: str, debug: bool = False):
+        if self.is_jellyfin or self.is_m3u:
+            return self.format
+        if self.format != "auto":
+            if debug:
+                print(
+                    "[PlaylistFormatter::detect(first_line='{}')] format invalid: {}".format(first_line, self.format),
+                    file=sys.stderr,
+                )
+            return False
+        if debug:
+            print(
+                "[PlaylistFormatter::detect(first_line='{}')] auto-detecting format".format(first_line),
+                file=sys.stderr,
+            )
+        if jf.is_valid_first_line(first_line):
+            self.format = "jellyfin"
+        elif m3u.is_valid_first_line(first_line):
+            self.format = "m3u"
+        else:
+            if debug:
+                print(
+                    "[PlaylistFormatter::detect(first_line='{}')] cannot detect format".format(first_line),
+                    file=sys.stderr,
+                )
+            return False
+        if debug:
+            print(
+                "[PlaylistFormatter::detect(first_line='{}')] detected {}".format(first_line, self.format),
+                file=sys.stderr,
+            )
+        return self.format
+
+
+def construct_playlist(formatter: PlaylistFormatter, file_path: str, debug: bool = False):
+    with open(file_path, "r") as p:
+        if not formatter.detect(p.readline().rstrip(), debug):
+            print("invalid playlist format", file=sys.stderr)
+            exit(1)
+    if formatter.is_jellyfin:
+        return jf.JFPlaylist.parse(file_path, debug)
+    elif formatter.is_m3u:
+        return m3u.M3U.parse(file_path, debug)
+    else:
+        print("invalid playlist", file=sys.stderr)
+        exit(1)
+
+
+def get_paths(playlist, relative_path: str = None, subst_path: str = None):
+    raw_paths = []
+    if type(playlist) is jf.JFPlaylist:
+        raw_paths = [item.path for item in playlist.playlist_items]
+    elif type(playlist) is m3u.M3U:
+        raw_paths = [e.entry for e in playlist.entries]
+
+    if relative_path:
+        return [os.path.relpath(p, relative_path) for p in raw_paths]
+    if subst_path:
+        search, replace = subst_path.split(":")
+        search_regex = re.compile(search)
+        return [search_regex.sub(replace, p) for p in raw_paths]
+    return raw_paths
+
+
+def create_m3u_from_list(entries: List[str]):
+    return m3u.M3U(True, None, [m3u.M3UEntry(e) for e in entries])
+
+
+@click.group()
+@click.pass_context
+@click.option(
+    "--input-format",
+    type=click.Choice(PlaylistFormatter.FORMATS),
+    default="auto",
+    help="Format of the input playlist. Defaults to 'auto'.",
+)
+@click.option("--debug", flag_value=True, help="Enable debug prints")
+def cli(ctx, input_format: str, debug: bool):
+    """playlist_convert"""
+    ctx.obj = {"debug": debug, "formatter": PlaylistFormatter(input_format)}
+    locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
+
+
+@cli.command("to-m3u")
+@click.option("--name", help="Name to set in m3u ext")
+@click.option("--relativize", help="Make entry paths relative to given path")
+@click.option("--subst-path", help="Substitute entry paths to given path (':' sepearted, regex supported)")
+@click.argument("playlist")
+@click.pass_context
+def to_m3u_command(ctx, name: str, relativize: str, subst_path: str, playlist: str):
+    """Convert to m3u format"""
+
+    formatter = ctx.obj["formatter"]
+    playlist_obj = construct_playlist(formatter, playlist, ctx.obj["debug"])
+    m3u_playlist = create_m3u_from_list(get_paths(playlist_obj, relativize, subst_path))
+
+    if name:
+        m3u_playlist.enable_ext()
+        m3u_playlist.set_playlist_name(name)
+    elif playlist_obj.get_playlist_name():
+        m3u_playlist.enable_ext()
+        m3u_playlist.set_playlist_name(playlist_obj.get_playlist_name())
+
+    print(m3u_playlist)
+
+
+@cli.command("validate")
+@click.option("--relativize", help="Make entry paths relative to given path")
+@click.option("--subst-path", help="Substitute entry paths to given path (':' sepearted, regex supported)")
+@click.argument("playlist")
+@click.pass_context
+def validate_command(ctx, relativize: str, subst_path: str, playlist: str):
+    """Validate playlist format and paths"""
+
+    formatter = ctx.obj["formatter"]
+    playlist_obj = construct_playlist(formatter, playlist, ctx.obj["debug"])
+    paths = get_paths(playlist_obj, relativize, subst_path)
+
+    valid_count = 0
+    invalid_count = 0
+    for p in paths:
+        if os.path.exists(p):
+            valid_count += 1
+            if ctx.obj["debug"]:
+                print("[validate_command({})] valid path: {}".format(playlist, p), file=sys.stderr)
+        else:
+            invalid_count += 1
+            print("INVALID PATH: {}".format(p))
+
+    if valid_count > 0 and invalid_count == 0:
+        print("{} is valid".format(playlist))
+
+
+@cli.command()
+def autocompletion():
+    subprocess.run(
+        [str(Path(__file__).resolve())], env={"_PLCONVERT_COMPLETE": "bash_source", "LANG": "C.UTF-8"}, shell=True
+    )
+
+
+if __name__ == "__main__":
+    cli()
